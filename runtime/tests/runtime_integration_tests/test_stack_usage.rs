@@ -281,7 +281,7 @@ fn measure_runtime_command_stack_usage() {
             &mut Command::DeriveContext(&export_cdi_cmd),
             DpeResult::Success,
         ) {
-            Some(Response::DeriveContextExportedCdi(resp)) => resp.exported_cdi,
+            Some(Response::DeriveContextExportedCdi(resp)) => resp.header.exported_cdi,
             _ => panic!("expected an exported-CDI derive-context response"),
         };
 
