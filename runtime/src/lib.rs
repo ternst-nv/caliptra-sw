@@ -458,6 +458,7 @@ impl DpeEnv for CaliptraDpeEnv<'_> {
     }
 }
 
+#[inline(never)]
 fn ec_dpe_env(
     drivers: &mut Drivers,
     dmtf_device_info: Option<ArrayVec<u8, { MAX_OTHER_NAME_SIZE }>>,
@@ -501,7 +502,11 @@ fn ec_dpe_env(
     })
 }
 
+// The ML-DSA DPE identity signs leaf certificates with the PQ.DevID key (derived
+// from the PQ.DevID CDI), reusing the shared DPE state. There is no separate RT
+// ML-DSA alias.
 #[cfg(feature = "mldsa_attestation")]
+#[inline(never)]
 fn mldsa_dpe_env(
     drivers: &mut Drivers,
     dmtf_device_info: Option<ArrayVec<u8, { MAX_OTHER_NAME_SIZE }>>,
@@ -528,7 +533,7 @@ fn mldsa_dpe_env(
             CaliptraDpeProfile::Mldsa,
             pl0_pauser,
             digest,
-            &drivers.cert_chain,
+            &drivers.mldsa_cert_chain,
             nb,
             nf,
             dmtf_device_info,
