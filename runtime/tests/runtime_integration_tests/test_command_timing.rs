@@ -11,6 +11,10 @@
 //! so that state builders (auth manifest, exported CDI, tagged contexts) run
 //! before their consumers.
 //!
+//! When built with `mldsa_attestation`, the test runs against the PQC-enabled
+//! firmware and additionally measures the three ML-DSA-87 commands `SET_PQ_SEED`,
+//! `GET_PQ_CSR`, and `CERTIFY_KEY_EXTENDED_MLDSA87` (see `run_pqc_command_suite`).
+//!
 //! The mechanism relies on `DefaultHwModel::cycle_count()`, which reads the
 //! emulated CPU's clock counter. It is therefore only meaningful against the
 //! software emulator.
@@ -21,6 +25,11 @@ use crate::test_measurements_common::{run_command_suite, CommandSampler};
 use caliptra_api::SocManager;
 use caliptra_hw_model::{DefaultHwModel, HwModel};
 use caliptra_runtime::RtBootStatus;
+
+#[cfg(feature = "mldsa_attestation")]
+use crate::test_measurements_common::run_pqc_command_suite;
+#[cfg(feature = "mldsa_attestation")]
+use caliptra_builder::firmware::APP_MLDSA_ATTESTATION;
 
 struct CycleSampler {
     start: u64,
@@ -38,12 +47,33 @@ impl CommandSampler for CycleSampler {
 
 #[test]
 fn measure_runtime_command_timing() {
+    #[cfg(feature = "mldsa_attestation")]
+    let mut model = run_rt_test(RuntimeTestArgs {
+        test_fwid: Some(&APP_MLDSA_ATTESTATION),
+        ..Default::default()
+    });
+    #[cfg(not(feature = "mldsa_attestation"))]
     let mut model = run_rt_test(RuntimeTestArgs::default());
+
     model.step_until(|m| {
         m.soc_ifc().cptra_boot_status().read() == u32::from(RtBootStatus::RtReadyForCommands)
     });
 
-    let mut results = run_command_suite(&mut model, &mut CycleSampler { start: 0 });
+    let mut results: Vec<(&'static str, u64)> = Vec::new();
+
+    // Measure the PQC commands first so they run before the side-effecting
+    // commands (DISABLE_ATTESTATION/SHUTDOWN) at the tail of the standard suite,
+    // and so GET_PQ_CSR / CERTIFY_KEY_EXTENDED_MLDSA87 run with PQC mode enabled.
+    #[cfg(feature = "mldsa_attestation")]
+    results.extend(run_pqc_command_suite(
+        &mut model,
+        &mut CycleSampler { start: 0 },
+    ));
+
+    results.extend(run_command_suite(
+        &mut model,
+        &mut CycleSampler { start: 0 },
+    ));
 
     results.sort_by_key(|b| std::cmp::Reverse(b.1));
     println!("\nRuntime command cycle cost (emulated clock cycles):");

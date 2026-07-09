@@ -485,3 +485,68 @@ pub fn run_command_suite(
 
     results
 }
+
+/// Drive the three PQC (ML-DSA-87) commands through `sampler`, in
+/// dependency order, and return `(name, measurement)` pairs unsorted.
+///
+/// `SET_PQ_SEED` provisions the PQ.DevID CDI and enables PQC mode, so it must
+/// precede `GET_PQ_CSR` and `CERTIFY_KEY_EXTENDED_MLDSA87` — otherwise both
+/// early-return before their maximal ML-DSA-87 keygen+sign flow. Because these
+/// have no side effects that break the standard suite (unlike `SHUTDOWN`), a
+/// caller should measure this suite *before* `run_command_suite`.
+#[cfg(feature = "mldsa_attestation")]
+pub fn run_pqc_command_suite(
+    model: &mut DefaultHwModel,
+    sampler: &mut dyn CommandSampler,
+) -> Vec<(&'static str, u64)> {
+    use caliptra_common::mailbox_api::{
+        CertifyKeyExtendedMldsa87Req, SetPqSeedReq, SET_PQ_SEED_SEED_SIZE,
+    };
+    use dpe::commands::CertifyKeyMldsa87Cmd;
+
+    let mut results: Vec<(&'static str, u64)> = Vec::new();
+
+    // SET_PQ_SEED — provisions the PQ.DevID CDI / enables PQC mode.
+    results.push((
+        "SET_PQ_SEED",
+        measure_req(
+            sampler,
+            model,
+            CommandId::SET_PQ_SEED,
+            MailboxReq::SetPqSeed(SetPqSeedReq {
+                hdr: MailboxReqHeader { chksum: 0 },
+                seed: [0x5a; SET_PQ_SEED_SEED_SIZE],
+            }),
+        ),
+    ));
+
+    // GET_PQ_CSR — header-only request; runs the full ML-DSA-87 keygen+sign+CSR path.
+    results.push((
+        "GET_PQ_CSR",
+        measure_hdr(sampler, model, CommandId::GET_PQ_CSR),
+    ));
+
+    // CERTIFY_KEY_EXTENDED_MLDSA87 — certify the default DPE context under the
+    // ML-DSA-87 (PQ.DevID) identity (leaf keygen + alias signing).
+    let certify_key_cmd = CertifyKeyMldsa87Cmd {
+        handle: ContextHandle::default(),
+        flags: CertifyKeyFlags::empty(),
+        format: CertifyKeyCommand::FORMAT_X509,
+        label: TEST_LABEL,
+    };
+    results.push((
+        "CERTIFY_KEY_EXTENDED_MLDSA87",
+        measure_req(
+            sampler,
+            model,
+            CommandId::CERTIFY_KEY_EXTENDED_MLDSA87,
+            MailboxReq::CertifyKeyExtendedMldsa87(CertifyKeyExtendedMldsa87Req {
+                hdr: MailboxReqHeader { chksum: 0 },
+                flags: CertifyKeyExtendedFlags::empty(),
+                certify_key_req: certify_key_cmd.as_bytes().try_into().unwrap(),
+            }),
+        ),
+    ));
+
+    results
+}
