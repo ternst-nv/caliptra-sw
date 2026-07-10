@@ -121,7 +121,7 @@ use tagging::{GetTaggedTciCmd, TagTciCmd};
 
 use caliptra_common::cprintln;
 
-use caliptra_drivers::{CaliptraError, CaliptraResult, ResetReason};
+use caliptra_drivers::{Array4x12, CaliptraError, CaliptraResult, ResetReason};
 use caliptra_registers::mbox::enums::MboxStatusE;
 pub use dpe::{context::ContextState, tci::TciMeasurement, DpeInstance, U8Bool, MAX_HANDLES};
 use dpe::{dpe_instance::DpeEnv, support::Support};
@@ -515,14 +515,15 @@ fn mldsa_dpe_env(
     let (seed, _, digest) = drivers.compute_mldsa_key_material()?;
 
     let pdata = drivers.persistent_data.get_mut();
+    let root_cdi = Array4x12::from(&pdata.pq_devid_cdi);
     let crypto = DpeCrypto::new_mldsa87(
         &mut drivers.sha384,
         &mut drivers.trng,
         &mut drivers.hmac384,
         &mut drivers.key_vault,
-        &pdata.pq_devid_cdi,
+        root_cdi,
         &mut pdata.exported_cdi_slots,
-        &pdata.mldsa_exported_cdi_slots,
+        &mut pdata.mldsa_exported_cdi_slots,
         seed,
     )?;
     let pl0_pauser = pdata.manifest1.header.pl0_pauser;

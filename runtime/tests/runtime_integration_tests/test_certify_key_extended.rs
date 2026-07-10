@@ -252,7 +252,10 @@ fn test_certify_key_extended_different_labels_produce_different_keys() {
     });
     req.populate_chksum().unwrap();
     let resp_a = model
-        .mailbox_execute(u32::from(CommandId::CERTIFY_KEY_EXTENDED), req.as_bytes().unwrap())
+        .mailbox_execute(
+            u32::from(CommandId::CERTIFY_KEY_EXTENDED),
+            req.as_bytes().unwrap(),
+        )
         .unwrap()
         .expect("expected a response for call A");
     let mut outer_a = CertifyKeyExtendedResp::new_zeroed();
@@ -279,7 +282,10 @@ fn test_certify_key_extended_different_labels_produce_different_keys() {
     });
     req.populate_chksum().unwrap();
     let resp_b = model
-        .mailbox_execute(u32::from(CommandId::CERTIFY_KEY_EXTENDED), req.as_bytes().unwrap())
+        .mailbox_execute(
+            u32::from(CommandId::CERTIFY_KEY_EXTENDED),
+            req.as_bytes().unwrap(),
+        )
         .unwrap()
         .expect("expected a response for call B");
     let mut outer_b = CertifyKeyExtendedResp::new_zeroed();
@@ -294,8 +300,7 @@ fn test_certify_key_extended_different_labels_produce_different_keys() {
     };
 
     assert_ne!(
-        inner_a.header.derived_pubkey_x,
-        inner_b.header.derived_pubkey_x,
+        inner_a.header.derived_pubkey_x, inner_b.header.derived_pubkey_x,
         "different labels must produce different derived P-384 public keys"
     );
 }

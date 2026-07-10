@@ -37,12 +37,22 @@ use dpe::{EcdsaAlgorithm, ExportedCdiHandle, U8Bool, MAX_EXPORTED_CDI_SIZE};
 use {
     caliptra_drivers::{
         Hmac384Key, Mldsa87, Mldsa87Mu, Mldsa87PubKey, Mldsa87Seed, Mldsa87Signature,
-        MldsaExportedCdiEntry, PqDevIdCdi, MLDSA87_PRIVATE_SEED_BYTES,
+        MldsaExportedCdiEntry, MLDSA87_PRIVATE_SEED_BYTES, PQ_DEVID_CDI_SIZE,
     },
     crypto::ml_dsa::{MldsaAlgorithm, MldsaPublicKey, MldsaSignature},
     zerocopy::FromBytes,
     zeroize::Zeroizing,
 };
+
+// Holds the derived DPE CDI, either as a key-vault slot (ECDSA) or in memory (ML-DSA).
+// ML-DSA cannot use key-vault-sourced HMAC keys with memory output because the
+// hardware security model zeroes any CPU reads of the HMAC tag when key_from_kv=true.
+#[allow(clippy::large_enum_variant)]
+enum DerivedCdi {
+    Ec(KeyId),
+    #[cfg(feature = "mldsa_attestation")]
+    Mldsa(Zeroizing<Array4x12>),
+}
 
 pub struct DpeCrypto<'a> {
     trng: &'a mut Trng,
@@ -50,15 +60,15 @@ pub struct DpeCrypto<'a> {
     key_vault: &'a mut KeyVault,
     signer: Signer<'a>,
     hasher: DpeHasher<'a>,
-    cdi: Option<KeyId>,
+    cdi: Option<DerivedCdi>,
     derived_key: Option<DerivedKey>,
-    rt_cdi: RtCdi,
-    exported_cdi_slots: &'a mut ExportedCdiHandles,
-    /// Single ML-DSA exported-CDI slot (raw CDI bytes in persistent data). Only
-    /// populated for the ML-DSA signer; the ECDSA exported CDIs live in
-    /// `exported_cdi_slots`.
+    // Some for ECDSA (KV slot holding RT CDI); None for ML-DSA (uses mldsa_root_cdi instead).
+    key_id_rt_cdi: Option<KeyId>,
     #[cfg(feature = "mldsa_attestation")]
-    mldsa_exported_cdi_slot: Option<&'a MldsaExportedCdiEntry>,
+    mldsa_root_cdi: Zeroizing<Array4x12>,
+    exported_cdi_slots: &'a mut ExportedCdiHandles,
+    #[cfg(feature = "mldsa_attestation")]
+    mldsa_exported_cdi_slots: Option<&'a mut MldsaExportedCdiEntry>,
 }
 
 impl<'a> DpeCrypto<'a> {
@@ -86,10 +96,12 @@ impl<'a> DpeCrypto<'a> {
             hasher: DpeHasher::new(sha384)?,
             cdi: None,
             derived_key: None,
-            rt_cdi: RtCdi::Ec(key_id_rt_cdi),
+            key_id_rt_cdi: Some(key_id_rt_cdi),
+            #[cfg(feature = "mldsa_attestation")]
+            mldsa_root_cdi: Zeroizing::new(Array4x12::default()),
             exported_cdi_slots,
             #[cfg(feature = "mldsa_attestation")]
-            mldsa_exported_cdi_slot: None,
+            mldsa_exported_cdi_slots: None,
         })
     }
 
@@ -100,9 +112,9 @@ impl<'a> DpeCrypto<'a> {
         trng: &'a mut Trng,
         hmac384: &'a mut Hmac384,
         key_vault: &'a mut KeyVault,
-        pq_devid_cdi: &'a PqDevIdCdi,
+        root_cdi: Array4x12,
         exported_cdi_slots: &'a mut ExportedCdiHandles,
-        mldsa_exported_cdi_slot: &'a MldsaExportedCdiEntry,
+        mldsa_exported_cdi_slots: &'a mut MldsaExportedCdiEntry,
         rt_seed: Mldsa87Seed,
     ) -> CaliptraResult<Self> {
         Ok(Self {
@@ -113,33 +125,28 @@ impl<'a> DpeCrypto<'a> {
             hasher: DpeHasher::new(sha384)?,
             cdi: None,
             derived_key: None,
-            rt_cdi: RtCdi::Mldsa(*pq_devid_cdi),
+            key_id_rt_cdi: None,
+            mldsa_root_cdi: Zeroizing::new(root_cdi),
             exported_cdi_slots,
-            mldsa_exported_cdi_slot: Some(mldsa_exported_cdi_slot),
+            mldsa_exported_cdi_slots: Some(mldsa_exported_cdi_slots),
         })
     }
 
-    fn derive_cdi_inner(
+    // EC-only: HMAC from key-vault RT CDI → key-vault output slot.
+    fn derive_cdi_inner_ec(
         &mut self,
         measurement: &Digest,
         info: &[u8],
         key_id: KeyId,
     ) -> Result<KeyId, CryptoError> {
+        let key_id_rt_cdi = self
+            .key_id_rt_cdi
+            .ok_or(CryptoError::CryptoLibError(0x100))?;
         let context = self.hash_all(&[&measurement.as_slice(), &info])?;
-        #[cfg(feature = "mldsa_attestation")]
-        let array: Array4x12;
-        let key = match self.rt_cdi {
-            RtCdi::Ec(key_id) => KeyReadArgs::new(key_id).into(),
-            #[cfg(feature = "mldsa_attestation")]
-            RtCdi::Mldsa(pq_devid_cdi) => {
-                array = Array4x12::from(pq_devid_cdi);
-                (&array).into()
-            }
-        };
 
         hmac384_kdf(
             self.hmac384,
-            key,
+            KeyReadArgs::new(key_id_rt_cdi).into(),
             b"derive_cdi",
             Some(context.as_slice()),
             self.trng,
@@ -155,7 +162,32 @@ impl<'a> DpeCrypto<'a> {
         Ok(key_id)
     }
 
-    // Derive only the ML-DSA seed from the CDI.
+    // ML-DSA: HMAC from in-memory root CDI → in-memory output. key_from_kv stays
+    // false so the hardware security model does not zero the HMAC tag on CPU reads.
+    #[cfg(feature = "mldsa_attestation")]
+    fn derive_cdi_inner_mldsa(
+        &mut self,
+        measurement: &Digest,
+        info: &[u8],
+    ) -> Result<Zeroizing<Array4x12>, CryptoError> {
+        let context = self.hash_all(&[&measurement.as_slice(), &info])?;
+        // Copy root CDI to the stack before borrowing self.hmac384/trng.
+        let root_copy: Array4x12 = *self.mldsa_root_cdi;
+        let mut output = Zeroizing::new(Array4x12::default());
+        hmac384_kdf(
+            self.hmac384,
+            (&root_copy).into(),
+            b"derive_cdi",
+            Some(context.as_slice()),
+            self.trng,
+            (&mut *output).into(),
+        )
+        .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
+        Ok(output)
+    }
+
+    // Derive only the ML-DSA seed from an in-memory CDI.
+    // Takes &Array4x12 so key_from_kv=false, making the HMAC tag visible to the CPU.
     #[cfg(feature = "mldsa_attestation")]
     fn derive_key_pair_mldsa(
         &mut self,
@@ -375,6 +407,33 @@ impl Crypto for DpeCrypto<'_> {
         let mut exported_cdi_handle = [0; MAX_EXPORTED_CDI_SIZE];
         self.rand_bytes(&mut exported_cdi_handle)?;
 
+        // ML-DSA: CDI cannot live in a key-vault slot, so use the dedicated
+        // in-memory persistent-data slot (mldsa_exported_cdi_slots).
+        #[cfg(feature = "mldsa_attestation")]
+        if matches!(self.signer, Signer::Mldsa { .. }) {
+            // Only one ML-DSA exported CDI slot exists; reject if it is in use.
+            // Check before deriving (derive_cdi_inner_mldsa needs &mut self).
+            {
+                let slot = self
+                    .mldsa_exported_cdi_slots
+                    .as_deref()
+                    .ok_or(CryptoError::CryptoLibError(0x102))?;
+                if slot.active.get() {
+                    return Err(CryptoError::ExportedCdiHandleLimitExceeded);
+                }
+            }
+            let mldsa_cdi = self.derive_cdi_inner_mldsa(measurement, info)?;
+            let cdi_bytes = <[u8; PQ_DEVID_CDI_SIZE as usize]>::from(*mldsa_cdi);
+            let slot = self
+                .mldsa_exported_cdi_slots
+                .as_deref_mut()
+                .ok_or(CryptoError::CryptoLibError(0x102))?;
+            slot.cdi = cdi_bytes;
+            slot.handle = exported_cdi_handle;
+            slot.active = U8Bool::new(true);
+            return Ok(exported_cdi_handle);
+        }
+
         // Currently we only use one slot for export CDIs.
         let cdi_slot = KEY_ID_EXPORTED_DPE_CDI;
         // Copy the CDI slots to work around the borrow checker.
@@ -396,7 +455,7 @@ impl Crypto for DpeCrypto<'_> {
                     active,
                 } if !active.get() => {
                     // Empty slot
-                    let cdi = self.derive_cdi_inner(measurement, info, cdi_slot)?;
+                    let cdi = self.derive_cdi_inner_ec(measurement, info, cdi_slot)?;
                     *slot = ExportedCdiEntry {
                         key: cdi,
                         handle: exported_cdi_handle,
@@ -420,7 +479,18 @@ impl Crypto for DpeCrypto<'_> {
         measurement: &Digest,
         info: &[u8],
     ) -> Result<&mut dyn CdiManager, CryptoError> {
-        self.cdi = Some(self.derive_cdi_inner(measurement, info, KEY_ID_DPE_CDI)?);
+        #[cfg(feature = "mldsa_attestation")]
+        if matches!(self.signer, Signer::Mldsa { .. }) {
+            self.cdi = Some(DerivedCdi::Mldsa(
+                self.derive_cdi_inner_mldsa(measurement, info)?,
+            ));
+            return Ok(self);
+        }
+        self.cdi = Some(DerivedCdi::Ec(self.derive_cdi_inner_ec(
+            measurement,
+            info,
+            KEY_ID_DPE_CDI,
+        )?));
         Ok(self)
     }
 
@@ -461,7 +531,8 @@ impl Crypto for DpeCrypto<'_> {
                 // persistent-data slot; derive directly from those bytes.
                 let cdi = {
                     let slot = self
-                        .mldsa_exported_cdi_slot
+                        .mldsa_exported_cdi_slots
+                        .as_deref()
                         .ok_or(CryptoError::InvalidExportedCdiHandle)?;
                     if !(slot.active.get() && constant_time_eq(&slot.handle, exported_handle)) {
                         return Err(CryptoError::InvalidExportedCdiHandle);
@@ -498,24 +569,36 @@ impl CdiManager for DpeCrypto<'_> {
         label: &[u8],
         info: &[u8],
     ) -> Result<&mut dyn crypto::Signer, CryptoError> {
-        let cdi: KeyId = self.cdi.ok_or(CryptoError::CryptoLibError(1))?;
+        // Use a flag to avoid holding a borrow of self.signer while calling methods.
+        #[cfg(feature = "mldsa_attestation")]
+        let is_mldsa = matches!(self.signer, Signer::Mldsa { .. });
+        #[cfg(not(feature = "mldsa_attestation"))]
+        let is_mldsa = false;
 
-        match self.signer {
-            Signer::Ec { .. } => {
-                self.derived_key = Some(DerivedKey::Ec(self.derive_key_pair_ec(
-                    &cdi,
-                    label,
-                    info,
-                    KEY_ID_DPE_PRIV_KEY,
-                )?));
-            }
-
+        if is_mldsa {
             #[cfg(feature = "mldsa_attestation")]
-            Signer::Mldsa { .. } => {
+            {
+                // Copy CDI bytes to the stack so we can release the borrow on self.cdi
+                // before calling derive_key_pair_mldsa which needs &mut self.
+                let cdi_bytes = match &self.cdi {
+                    Some(DerivedCdi::Mldsa(b)) => **b,
+                    _ => return Err(CryptoError::CryptoLibError(1)),
+                };
                 let mut seed = Mldsa87Seed::default();
-                self.derive_key_pair_mldsa(KeyReadArgs::new(cdi).into(), label, info, &mut seed)?;
+                self.derive_key_pair_mldsa((&cdi_bytes).into(), label, info, &mut seed)?;
                 self.derived_key = Some(DerivedKey::Mldsa(seed));
             }
+        } else {
+            let cdi = match &self.cdi {
+                Some(DerivedCdi::Ec(k)) => *k,
+                _ => return Err(CryptoError::CryptoLibError(1)),
+            };
+            self.derived_key = Some(DerivedKey::Ec(self.derive_key_pair_ec(
+                &cdi,
+                label,
+                info,
+                KEY_ID_DPE_PRIV_KEY,
+            )?));
         }
         Ok(self)
     }
@@ -588,10 +671,4 @@ enum DerivedKey {
     Ec((KeyId, PubKey)),
     #[cfg(feature = "mldsa_attestation")]
     Mldsa(Mldsa87Seed),
-}
-
-enum RtCdi {
-    Ec(KeyId),
-    #[cfg(feature = "mldsa_attestation")]
-    Mldsa(PqDevIdCdi),
 }

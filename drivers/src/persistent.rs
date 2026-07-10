@@ -497,6 +497,14 @@ impl PersistentData {
             );
 
             persistent_data_offset += PQC_STATUS_FLAGS_SIZE;
+            #[cfg(all(feature = "mldsa_attestation", feature = "runtime"))]
+            {
+                assert_eq!(
+                    addr_of!((*P).mldsa_exported_cdi_slots) as u32,
+                    memory_layout::PERSISTENT_DATA_ORG + persistent_data_offset
+                );
+                persistent_data_offset += MLDSA_EXPORTED_CDI_HANDLES_SIZE;
+            }
             assert_eq!(
                 addr_of!((*P).mldsa_exported_cdi_slots) as u32,
                 memory_layout::PERSISTENT_DATA_ORG + persistent_data_offset
