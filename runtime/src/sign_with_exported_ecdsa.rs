@@ -55,6 +55,8 @@ impl SignWithExportedEcdsaCmd {
             key_id_rt_cdi,
             key_id_rt_priv_key,
             &mut pdata.exported_cdi_slots,
+            #[cfg(feature = "mldsa_attestation")]
+            &mut pdata.mldsa_exported_cdi_slots,
         )?;
 
         let data = Digest::Sha384(crypto::Sha384(cmd.tbs)).into();

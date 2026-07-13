@@ -68,7 +68,7 @@ pub struct DpeCrypto<'a> {
     mldsa_root_cdi: Zeroizing<Array4x12>,
     exported_cdi_slots: &'a mut ExportedCdiHandles,
     #[cfg(feature = "mldsa_attestation")]
-    mldsa_exported_cdi_slots: Option<&'a mut MldsaExportedCdiEntry>,
+    mldsa_exported_cdi: &'a mut MldsaExportedCdiEntry,
 }
 
 impl<'a> DpeCrypto<'a> {
@@ -83,6 +83,7 @@ impl<'a> DpeCrypto<'a> {
         key_id_rt_cdi: KeyId,
         key_id_rt_priv_key: KeyId,
         exported_cdi_slots: &'a mut ExportedCdiHandles,
+        #[cfg(feature = "mldsa_attestation")] mldsa_exported_cdi: &'a mut MldsaExportedCdiEntry,
     ) -> CaliptraResult<Self> {
         Ok(Self {
             trng,
@@ -101,7 +102,7 @@ impl<'a> DpeCrypto<'a> {
             mldsa_root_cdi: Zeroizing::new(Array4x12::default()),
             exported_cdi_slots,
             #[cfg(feature = "mldsa_attestation")]
-            mldsa_exported_cdi_slots: None,
+            mldsa_exported_cdi,
         })
     }
 
@@ -114,7 +115,7 @@ impl<'a> DpeCrypto<'a> {
         key_vault: &'a mut KeyVault,
         root_cdi: Array4x12,
         exported_cdi_slots: &'a mut ExportedCdiHandles,
-        mldsa_exported_cdi_slots: &'a mut MldsaExportedCdiEntry,
+        mldsa_exported_cdi: &'a mut MldsaExportedCdiEntry,
         rt_seed: Mldsa87Seed,
     ) -> CaliptraResult<Self> {
         Ok(Self {
@@ -128,7 +129,7 @@ impl<'a> DpeCrypto<'a> {
             key_id_rt_cdi: None,
             mldsa_root_cdi: Zeroizing::new(root_cdi),
             exported_cdi_slots,
-            mldsa_exported_cdi_slots: Some(mldsa_exported_cdi_slots),
+            mldsa_exported_cdi,
         })
     }
 
@@ -408,26 +409,18 @@ impl Crypto for DpeCrypto<'_> {
         self.rand_bytes(&mut exported_cdi_handle)?;
 
         // ML-DSA: CDI cannot live in a key-vault slot, so use the dedicated
-        // in-memory persistent-data slot (mldsa_exported_cdi_slots).
+        // in-memory persistent-data slot (mldsa_exported_cdi).
         #[cfg(feature = "mldsa_attestation")]
         if matches!(self.signer, Signer::Mldsa { .. }) {
-            // Only one ML-DSA exported CDI slot exists; reject if it is in use.
-            // Check before deriving (derive_cdi_inner_mldsa needs &mut self).
-            {
-                let slot = self
-                    .mldsa_exported_cdi_slots
-                    .as_deref()
-                    .ok_or(CryptoError::CryptoLibError(0x102))?;
-                if slot.active.get() {
-                    return Err(CryptoError::ExportedCdiHandleLimitExceeded);
-                }
+            // Check capacity before deriving (derive_cdi_inner_mldsa needs &mut self).
+            if self.mldsa_exported_cdi.active.get() {
+                return Err(CryptoError::ExportedCdiHandleLimitExceeded);
             }
+
             let mldsa_cdi = self.derive_cdi_inner_mldsa(measurement, info)?;
             let cdi_bytes = <[u8; PQ_DEVID_CDI_SIZE as usize]>::from(*mldsa_cdi);
-            let slot = self
-                .mldsa_exported_cdi_slots
-                .as_deref_mut()
-                .ok_or(CryptoError::CryptoLibError(0x102))?;
+            let slot = &mut self.mldsa_exported_cdi;
+
             slot.cdi = cdi_bytes;
             slot.handle = exported_cdi_handle;
             slot.active = U8Bool::new(true);
@@ -530,10 +523,7 @@ impl Crypto for DpeCrypto<'_> {
                 // The ML-DSA exported CDI is held as raw bytes in a single
                 // persistent-data slot; derive directly from those bytes.
                 let cdi = {
-                    let slot = self
-                        .mldsa_exported_cdi_slots
-                        .as_deref()
-                        .ok_or(CryptoError::InvalidExportedCdiHandle)?;
+                    let slot = &self.mldsa_exported_cdi;
                     if !(slot.active.get() && constant_time_eq(&slot.handle, exported_handle)) {
                         return Err(CryptoError::InvalidExportedCdiHandle);
                     }
