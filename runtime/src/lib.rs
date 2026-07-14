@@ -459,6 +459,37 @@ impl DpeEnv for CaliptraDpeEnv<'_> {
 }
 
 #[inline(never)]
+// Shared tail for building a `CaliptraDpeEnv` once the algorithm-specific crypto,
+// profile, and issuer-name hash have been prepared.
+#[allow(clippy::too_many_arguments)]
+fn finish_dpe_env<'a>(
+    crypto: DpeCrypto<'a>,
+    profile: CaliptraDpeProfile,
+    hashed_pub_key: crypto::Digest,
+    cert_chain: &'a [u8],
+    manifest: &caliptra_image_types::ImageManifest,
+    dpe_state: &'a mut State,
+    dmtf_device_info: Option<ArrayVec<u8, { MAX_OTHER_NAME_SIZE }>>,
+    ueid: Option<[u8; 17]>,
+) -> CaliptraDpeEnv<'a> {
+    let pl0_pauser = manifest.header.pl0_pauser;
+    let (nb, nf) = Drivers::get_cert_validity_info(manifest);
+    CaliptraDpeEnv {
+        crypto,
+        platform: DpePlatform::new(
+            profile,
+            pl0_pauser,
+            hashed_pub_key,
+            cert_chain,
+            nb,
+            nf,
+            dmtf_device_info,
+            ueid,
+        ),
+        state: dpe_state,
+    }
+}
+
 fn ec_dpe_env(
     drivers: &mut Drivers,
     dmtf_device_info: Option<ArrayVec<u8, { MAX_OTHER_NAME_SIZE }>>,
@@ -486,22 +517,16 @@ fn ec_dpe_env(
         #[cfg(feature = "mldsa_attestation")]
         &mut pdata.mldsa_exported_cdi_slots,
     )?;
-    let pl0_pauser = pdata.manifest1.header.pl0_pauser;
-    let (nb, nf) = Drivers::get_cert_validity_info(&pdata.manifest1);
-    Ok(CaliptraDpeEnv {
+    Ok(finish_dpe_env(
         crypto,
-        platform: DpePlatform::new(
-            CaliptraDpeProfile::Ecc384,
-            pl0_pauser,
-            hashed_rt_pub_key,
-            &drivers.cert_chain,
-            nb,
-            nf,
-            dmtf_device_info,
-            ueid,
-        ),
-        state: &mut pdata.dpe,
-    })
+        CaliptraDpeProfile::Ecc384,
+        hashed_rt_pub_key,
+        &drivers.cert_chain,
+        &pdata.manifest1,
+        &mut pdata.dpe,
+        dmtf_device_info,
+        ueid,
+    ))
 }
 
 // The ML-DSA DPE identity signs leaf certificates with the PQ.DevID key (derived
@@ -528,20 +553,14 @@ fn mldsa_dpe_env(
         &mut pdata.mldsa_exported_cdi_slots,
         seed,
     )?;
-    let pl0_pauser = pdata.manifest1.header.pl0_pauser;
-    let (nb, nf) = Drivers::get_cert_validity_info(&pdata.manifest1);
-    Ok(CaliptraDpeEnv {
+    Ok(finish_dpe_env(
         crypto,
-        platform: DpePlatform::new(
-            CaliptraDpeProfile::Mldsa,
-            pl0_pauser,
-            digest,
-            &drivers.mldsa_cert_chain,
-            nb,
-            nf,
-            dmtf_device_info,
-            ueid,
-        ),
-        state: &mut pdata.dpe,
-    })
+        CaliptraDpeProfile::Mldsa,
+        digest,
+        &drivers.mldsa_cert_chain,
+        &pdata.manifest1,
+        &mut pdata.dpe,
+        dmtf_device_info,
+        ueid,
+    ))
 }

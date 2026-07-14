@@ -19,8 +19,8 @@ use caliptra_common::keyids::{
 use caliptra_dpe_response_buffer::ResponseBufError;
 use caliptra_drivers::{
     hmac384_kdf, sha384::DpeHasher, Array4x12, Ecc384, Ecc384PrivKeyIn, Ecc384PubKey, Ecc384Scalar,
-    Ecc384Seed, ExportedCdiEntry, ExportedCdiHandles, Hmac384, KeyId, KeyReadArgs, KeyUsage,
-    KeyVault, KeyWriteArgs, Sha384, Trng,
+    Ecc384Seed, ExportedCdiEntry, ExportedCdiHandles, Hmac384, Hmac384Key, Hmac384Tag, KeyId,
+    KeyReadArgs, KeyUsage, KeyVault, KeyWriteArgs, Sha384, Trng,
 };
 use caliptra_error::CaliptraResult;
 use constant_time_eq::constant_time_eq;
@@ -36,8 +36,8 @@ use dpe::{EcdsaAlgorithm, ExportedCdiHandle, U8Bool, MAX_EXPORTED_CDI_SIZE};
 #[cfg(feature = "mldsa_attestation")]
 use {
     caliptra_drivers::{
-        Hmac384Key, Mldsa87, Mldsa87Mu, Mldsa87PubKey, Mldsa87Seed, Mldsa87Signature,
-        MldsaExportedCdiEntry, MLDSA87_PRIVATE_SEED_BYTES, PQ_DEVID_CDI_SIZE,
+        Mldsa87, Mldsa87Mu, Mldsa87PubKey, Mldsa87Seed, Mldsa87Signature, MldsaExportedCdiEntry,
+        MLDSA87_PRIVATE_SEED_BYTES, PQ_DEVID_CDI_SIZE,
     },
     crypto::ml_dsa::{MldsaAlgorithm, MldsaPublicKey, MldsaSignature},
     zerocopy::FromBytes,
@@ -133,6 +133,27 @@ impl<'a> DpeCrypto<'a> {
         })
     }
 
+    // Shared "derive_cdi" HMAC-KDF step. `key` (KV RT CDI or in-memory root) and
+    // `output` (KV slot or in-memory buffer) vary by algorithm.
+    fn derive_cdi_kdf(
+        &mut self,
+        measurement: &Digest,
+        info: &[u8],
+        key: Hmac384Key,
+        output: Hmac384Tag,
+    ) -> Result<(), CryptoError> {
+        let context = self.hash_all(&[&measurement.as_slice(), &info])?;
+        hmac384_kdf(
+            self.hmac384,
+            key,
+            b"derive_cdi",
+            Some(context.as_slice()),
+            self.trng,
+            output,
+        )
+        .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))
+    }
+
     // EC-only: HMAC from key-vault RT CDI → key-vault output slot.
     fn derive_cdi_inner_ec(
         &mut self,
@@ -143,14 +164,10 @@ impl<'a> DpeCrypto<'a> {
         let key_id_rt_cdi = self
             .key_id_rt_cdi
             .ok_or(CryptoError::CryptoLibError(0x100))?;
-        let context = self.hash_all(&[&measurement.as_slice(), &info])?;
-
-        hmac384_kdf(
-            self.hmac384,
+        self.derive_cdi_kdf(
+            measurement,
+            info,
             KeyReadArgs::new(key_id_rt_cdi).into(),
-            b"derive_cdi",
-            Some(context.as_slice()),
-            self.trng,
             KeyWriteArgs::new(
                 key_id,
                 KeyUsage::default()
@@ -158,8 +175,7 @@ impl<'a> DpeCrypto<'a> {
                     .set_ecc_key_gen_seed_en(),
             )
             .into(),
-        )
-        .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
+        )?;
         Ok(key_id)
     }
 
@@ -171,19 +187,15 @@ impl<'a> DpeCrypto<'a> {
         measurement: &Digest,
         info: &[u8],
     ) -> Result<Zeroizing<Array4x12>, CryptoError> {
-        let context = self.hash_all(&[&measurement.as_slice(), &info])?;
         // Copy root CDI to the stack before borrowing self.hmac384/trng.
         let root_copy: Array4x12 = *self.mldsa_root_cdi;
         let mut output = Zeroizing::new(Array4x12::default());
-        hmac384_kdf(
-            self.hmac384,
+        self.derive_cdi_kdf(
+            measurement,
+            info,
             (&root_copy).into(),
-            b"derive_cdi",
-            Some(context.as_slice()),
-            self.trng,
             (&mut *output).into(),
-        )
-        .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
+        )?;
         Ok(output)
     }
 
@@ -215,7 +227,9 @@ impl<'a> DpeCrypto<'a> {
     }
 
     fn derive_key_pair_ec(
-        &mut self,
+        ecc384: &mut Ecc384,
+        hmac384: &mut Hmac384,
+        trng: &mut Trng,
         cdi: &KeyId,
         label: &[u8],
         info: &[u8],
@@ -224,36 +238,29 @@ impl<'a> DpeCrypto<'a> {
         let mut usage: KeyUsage = KeyUsage::default();
         let usage = usage.set_ecc_key_gen_seed_en();
 
-        match &mut self.signer {
-            Signer::Ec { ecc384, .. } => {
-                hmac384_kdf(
-                    self.hmac384,
-                    KeyReadArgs::new(*cdi).into(),
-                    label,
-                    Some(info),
-                    self.trng,
-                    KeyWriteArgs::new(KEY_ID_TMP, usage).into(),
-                )
-                .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
+        hmac384_kdf(
+            hmac384,
+            KeyReadArgs::new(*cdi).into(),
+            label,
+            Some(info),
+            trng,
+            KeyWriteArgs::new(KEY_ID_TMP, usage).into(),
+        )
+        .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
 
-                let pub_key = ecc384
-                    .key_pair(
-                        &Ecc384Seed::Key(KeyReadArgs::new(KEY_ID_TMP)),
-                        &Array4x12::default(),
-                        self.trng,
-                        KeyWriteArgs::new(key_id, KeyUsage::default().set_ecc_private_key_en())
-                            .into(),
-                    )
-                    .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
-                let pub_key = PubKey::Ecdsa(EcdsaPubKey::Ecdsa384(EcdsaPub384::from_slice(
-                    &pub_key.x.into(),
-                    &pub_key.y.into(),
-                )));
-                Ok((key_id, pub_key))
-            }
-            #[cfg(feature = "mldsa_attestation")]
-            _ => Err(CryptoError::MismatchedAlgorithm),
-        }
+        let pub_key = ecc384
+            .key_pair(
+                &Ecc384Seed::Key(KeyReadArgs::new(KEY_ID_TMP)),
+                &Array4x12::default(),
+                trng,
+                KeyWriteArgs::new(key_id, KeyUsage::default().set_ecc_private_key_en()).into(),
+            )
+            .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
+        let pub_key = PubKey::Ecdsa(EcdsaPubKey::Ecdsa384(EcdsaPub384::from_slice(
+            &pub_key.x.into(),
+            &pub_key.y.into(),
+        )));
+        Ok((key_id, pub_key))
     }
 
     #[inline(never)]
@@ -304,31 +311,6 @@ impl<'a> DpeCrypto<'a> {
         Ok(Signature::Ecdsa(EcdsaSignature::Ecdsa384(
             EcdsaSignature384::from_slice(&sig.r.into(), &sig.s.into()),
         )))
-    }
-
-    fn sign_helper_ec(
-        signer: &mut Signer,
-        hasher: &mut DpeHasher,
-        trng: &mut Trng,
-        data: &SignData,
-        key_pair: Option<(&PubKey, &KeyId)>,
-    ) -> Result<Signature, CryptoError> {
-        match (signer, key_pair) {
-            (Signer::Ec { ecc384, .. }, Some((pub_key, priv_key))) => {
-                Self::sign_ec(ecc384, hasher.driver(), trng, data, priv_key, pub_key)
-            }
-            (
-                Signer::Ec {
-                    ecc384,
-                    rt_pub_key,
-                    rt_priv_key,
-                    ..
-                },
-                None,
-            ) => Self::sign_ec(ecc384, hasher.driver(), trng, data, rt_priv_key, rt_pub_key),
-            #[cfg(feature = "mldsa_attestation")]
-            _ => Err(CryptoError::MismatchedAlgorithm),
-        }
     }
 
     #[cfg(feature = "mldsa_attestation")]
@@ -514,9 +496,22 @@ impl Crypto for DpeCrypto<'_> {
                     }
                     cdi.ok_or(CryptoError::InvalidExportedCdiHandle)?
                 };
-                self.derived_key = Some(DerivedKey::Ec(
-                    self.derive_key_pair_ec(&cdi, label, info, KEY_ID_TMP)?,
-                ));
+                // The derived key pair here is EC; grab the ECC engine out of
+                // the signer.
+                let ecc384 = match &mut self.signer {
+                    Signer::Ec { ecc384, .. } => ecc384,
+                    #[cfg(feature = "mldsa_attestation")]
+                    _ => return Err(CryptoError::MismatchedAlgorithm),
+                };
+                self.derived_key = Some(DerivedKey::Ec(Self::derive_key_pair_ec(
+                    ecc384,
+                    self.hmac384,
+                    self.trng,
+                    &cdi,
+                    label,
+                    info,
+                    KEY_ID_TMP,
+                )?));
             }
             #[cfg(feature = "mldsa_attestation")]
             Signer::Mldsa { .. } => {
@@ -539,15 +534,25 @@ impl Crypto for DpeCrypto<'_> {
     }
 
     fn sign_with_alias(&mut self, data: &SignData) -> Result<Signature, CryptoError> {
-        match self.signer {
-            Signer::Ec { .. } => {
-                Self::sign_helper_ec(&mut self.signer, &mut self.hasher, self.trng, data, None)
-            }
+        match &mut self.signer {
+            // Sign with the RT alias identity held in the signer.
+            Signer::Ec {
+                ecc384,
+                rt_pub_key,
+                rt_priv_key,
+            } => Self::sign_ec(
+                ecc384,
+                self.hasher.driver(),
+                self.trng,
+                data,
+                rt_priv_key,
+                rt_pub_key,
+            ),
 
             // The ML-DSA DPE leaf certificate is signed by the PQ.DevID alias
             // identity, whose seed is held in the signer.
             #[cfg(feature = "mldsa_attestation")]
-            Signer::Mldsa { ref rt_seed } => Self::sign_helper_mldsa(data, rt_seed),
+            Signer::Mldsa { rt_seed } => Self::sign_helper_mldsa(data, rt_seed),
         }
     }
 }
@@ -583,7 +588,15 @@ impl CdiManager for DpeCrypto<'_> {
                 Some(DerivedCdi::Ec(k)) => *k,
                 _ => return Err(CryptoError::CryptoLibError(1)),
             };
-            self.derived_key = Some(DerivedKey::Ec(self.derive_key_pair_ec(
+            let ecc384 = match &mut self.signer {
+                Signer::Ec { ecc384, .. } => ecc384,
+                #[cfg(feature = "mldsa_attestation")]
+                _ => return Err(CryptoError::MismatchedAlgorithm),
+            };
+            self.derived_key = Some(DerivedKey::Ec(Self::derive_key_pair_ec(
+                ecc384,
+                self.hmac384,
+                self.trng,
                 &cdi,
                 label,
                 info,
@@ -601,27 +614,20 @@ impl CdiManager for DpeCrypto<'_> {
 
 impl crypto::Signer for DpeCrypto<'_> {
     fn sign(&mut self, data: &SignData) -> Result<Signature, CryptoError> {
-        match self.signer {
-            Signer::Ec { .. } => {
-                let Some(DerivedKey::Ec((priv_key, pub_key))) = &self.derived_key else {
-                    return Err(CryptoError::CryptoLibError(3));
+        match &self.derived_key {
+            Some(DerivedKey::Ec((priv_key, pub_key))) => {
+                // The ECC engine lives in the signer; the derived key pair here
+                // already told us this is the EC profile.
+                let ecc384 = match &mut self.signer {
+                    Signer::Ec { ecc384, .. } => ecc384,
+                    #[cfg(feature = "mldsa_attestation")]
+                    _ => return Err(CryptoError::MismatchedAlgorithm),
                 };
-                Self::sign_helper_ec(
-                    &mut self.signer,
-                    &mut self.hasher,
-                    self.trng,
-                    data,
-                    Some((pub_key, priv_key)),
-                )
+                Self::sign_ec(ecc384, self.hasher.driver(), self.trng, data, priv_key, pub_key)
             }
-
             #[cfg(feature = "mldsa_attestation")]
-            Signer::Mldsa { .. } => {
-                let Some(DerivedKey::Mldsa(seed)) = &self.derived_key else {
-                    return Err(CryptoError::CryptoLibError(3));
-                };
-                Self::sign_helper_mldsa(data, seed)
-            }
+            Some(DerivedKey::Mldsa(seed)) => Self::sign_helper_mldsa(data, seed),
+            None => Err(CryptoError::CryptoLibError(3)),
         }
     }
 
