@@ -918,7 +918,7 @@ impl Drivers {
     /// in persistent data.
     #[cfg(feature = "mldsa_attestation")]
     #[inline(never)]
-    fn derive_devid_seed(&mut self, seed: &mut Mldsa87Seed) -> CaliptraResult<()> {
+    pub fn derive_devid_seed(&mut self, seed: &mut Mldsa87Seed) -> CaliptraResult<()> {
         let cdi = Zeroizing::new(Array4x12::from(&self.persistent_data.get().pq_devid_cdi));
         let mut output = Zeroizing::new(Array4x12::default());
         hmac384_kdf(

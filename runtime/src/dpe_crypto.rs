@@ -103,12 +103,13 @@ impl<'a> DpeCrypto<'a> {
         pq_devid_cdi: &'a PqDevIdCdi,
         exported_cdi_slots: &'a mut ExportedCdiHandles,
         mldsa_exported_cdi_slot: &'a MldsaExportedCdiEntry,
+        rt_seed: Mldsa87Seed,
     ) -> CaliptraResult<Self> {
         Ok(Self {
             trng,
             hmac384,
             key_vault,
-            signer: Signer::Mldsa,
+            signer: Signer::Mldsa { rt_seed },
             hasher: DpeHasher::new(sha384)?,
             cdi: None,
             derived_key: None,
@@ -154,9 +155,7 @@ impl<'a> DpeCrypto<'a> {
         Ok(key_id)
     }
 
-    /// Derive an ML-DSA-87 key pair from a CDI. The CDI is supplied as an
-    /// already-resolved HMAC key so the same derivation serves both the DPE CDI
-    /// (a key-vault slot) and an exported CDI (raw bytes in persistent data).
+    // Derive only the ML-DSA seed from the CDI.
     #[cfg(feature = "mldsa_attestation")]
     fn derive_key_pair_mldsa(
         &mut self,
@@ -331,7 +330,7 @@ impl SignatureType for DpeCrypto<'_> {
         match self.signer {
             Signer::Ec { .. } => SignatureAlgorithm::Ecdsa(EcdsaAlgorithm::Bit384),
             #[cfg(feature = "mldsa_attestation")]
-            Signer::Mldsa => SignatureAlgorithm::Mldsa(MldsaAlgorithm::Mldsa87),
+            Signer::Mldsa { .. } => SignatureAlgorithm::Mldsa(MldsaAlgorithm::Mldsa87),
         }
     }
 }
@@ -457,7 +456,7 @@ impl Crypto for DpeCrypto<'_> {
                 ));
             }
             #[cfg(feature = "mldsa_attestation")]
-            Signer::Mldsa => {
+            Signer::Mldsa { .. } => {
                 // The ML-DSA exported CDI is held as raw bytes in a single
                 // persistent-data slot; derive directly from those bytes.
                 let cdi = {
@@ -484,8 +483,10 @@ impl Crypto for DpeCrypto<'_> {
                 Self::sign_helper_ec(&mut self.signer, &mut self.hasher, self.trng, data, None)
             }
 
+            // The ML-DSA DPE leaf certificate is signed by the PQ.DevID alias
+            // identity, whose seed is held in the signer.
             #[cfg(feature = "mldsa_attestation")]
-            Signer::Mldsa => Err(CryptoError::MismatchedAlgorithm),
+            Signer::Mldsa { ref rt_seed } => Self::sign_helper_mldsa(data, rt_seed),
         }
     }
 }
@@ -510,7 +511,7 @@ impl CdiManager for DpeCrypto<'_> {
             }
 
             #[cfg(feature = "mldsa_attestation")]
-            Signer::Mldsa => {
+            Signer::Mldsa { .. } => {
                 let mut seed = Mldsa87Seed::default();
                 self.derive_key_pair_mldsa(KeyReadArgs::new(cdi).into(), label, info, &mut seed)?;
                 self.derived_key = Some(DerivedKey::Mldsa(seed));
@@ -542,7 +543,7 @@ impl crypto::Signer for DpeCrypto<'_> {
             }
 
             #[cfg(feature = "mldsa_attestation")]
-            Signer::Mldsa => {
+            Signer::Mldsa { .. } => {
                 let Some(DerivedKey::Mldsa(seed)) = &self.derived_key else {
                     return Err(CryptoError::CryptoLibError(3));
                 };
@@ -574,8 +575,11 @@ enum Signer<'a> {
         rt_pub_key: PubKey,
         rt_priv_key: KeyId,
     },
+    // The alias identity for the ML-DSA DPE is the PQ.DevID key (there is no
+    // separate RT ML-DSA alias); its seed is derived from the PQ.DevID CDI and
+    // used to sign DPE leaf certificates.
     #[cfg(feature = "mldsa_attestation")]
-    Mldsa,
+    Mldsa { rt_seed: Mldsa87Seed },
 }
 
 // The mldsa key is significantly larger than ecdsa.  Allow a large enum variant to support it.

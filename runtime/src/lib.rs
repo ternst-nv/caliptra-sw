@@ -501,14 +501,14 @@ fn ec_dpe_env(
     })
 }
 
-#[allow(dead_code)]
 #[cfg(feature = "mldsa_attestation")]
 fn mldsa_dpe_env(
     drivers: &mut Drivers,
     dmtf_device_info: Option<ArrayVec<u8, { MAX_OTHER_NAME_SIZE }>>,
     ueid: Option<[u8; 17]>,
 ) -> CaliptraResult<CaliptraDpeEnv<'_>> {
-    let (_, _, digest) = drivers.compute_mldsa_key_material()?;
+    let (seed, _, digest) = drivers.compute_mldsa_key_material()?;
+
     let pdata = drivers.persistent_data.get_mut();
     let crypto = DpeCrypto::new_mldsa87(
         &mut drivers.sha384,
@@ -518,6 +518,7 @@ fn mldsa_dpe_env(
         &pdata.pq_devid_cdi,
         &mut pdata.exported_cdi_slots,
         &pdata.mldsa_exported_cdi_slots,
+        seed,
     )?;
     let pl0_pauser = pdata.manifest1.header.pl0_pauser;
     let (nb, nf) = Drivers::get_cert_validity_info(&pdata.manifest1);
@@ -527,7 +528,7 @@ fn mldsa_dpe_env(
             CaliptraDpeProfile::Mldsa,
             pl0_pauser,
             digest,
-            &drivers.mldsa_cert_chain,
+            &drivers.cert_chain,
             nb,
             nf,
             dmtf_device_info,

@@ -7,7 +7,7 @@ use crate::{dpe_crypto::DpeCrypto, Drivers, PauserPrivileges};
 use caliptra_cfi_derive::cfi_impl_fn;
 
 use caliptra_common::mailbox_api::{SignWithExportedMldsaReq, SignWithExportedMldsaResp};
-use caliptra_drivers::MLDSA87_MU_BYTES;
+use caliptra_drivers::{Mldsa87Seed, MLDSA87_MU_BYTES};
 use caliptra_error::{CaliptraError, CaliptraResult};
 
 use crypto::{
@@ -54,6 +54,9 @@ impl SignWithExportedMldsaCmd {
             _ => return Err(CaliptraError::RUNTIME_SIGN_WITH_EXPORTED_MLDSA_INVALID_PARAMS),
         };
 
+        let mut seed = Mldsa87Seed::default();
+        drivers.derive_devid_seed(&mut seed)?;
+
         let pdata = drivers.persistent_data.get_mut();
         let mut crypto = DpeCrypto::new_mldsa87(
             &mut drivers.sha384,
@@ -63,6 +66,7 @@ impl SignWithExportedMldsaCmd {
             &pdata.pq_devid_cdi,
             &mut pdata.exported_cdi_slots,
             &pdata.mldsa_exported_cdi_slots,
+            seed,
         )?;
 
         let (Signature::Mldsa(MldsaSignature(sig)), PubKey::Mldsa(MldsaPublicKey(pub_key))) =
