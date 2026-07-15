@@ -95,15 +95,15 @@ pub use okref::okref;
 pub use pcr_bank::{PcrBank, PcrId};
 pub use pcr_reset::PcrResetCounter;
 pub use persistent::fmc_alias_csr::FmcAliasCsr;
-#[cfg(all(feature = "mldsa_attestation", feature = "runtime"))]
-pub use persistent::MldsaExportedCdiEntry;
 #[cfg(feature = "runtime")]
 pub use persistent::{AuthManifestImageMetadataList, ExportedCdiEntry, ExportedCdiHandles};
 
+#[cfg(all(feature = "mldsa_attestation", feature = "runtime"))]
+pub use persistent::MldsaExportedCdiEntry;
 pub use persistent::{
     FuseLogArray, IdevIdCsr, PcrLogArray, PersistentData, PersistentDataAccessor,
     StashMeasurementArray, FUSE_LOG_MAX_COUNT, MAX_FMC_ALIAS_CSR_SIZE, MAX_IDEVID_CSR_SIZE,
-    MEASUREMENT_MAX_COUNT, PCR_LOG_MAX_COUNT,
+    MEASUREMENT_MAX_COUNT, MLDSA_EXPORTED_CDI_HANDLES_SIZE, PCR_LOG_MAX_COUNT,
 };
 #[cfg(feature = "mldsa_attestation")]
 pub use persistent::{PqDevIdCdi, PQ_DEVID_CDI_SIZE};

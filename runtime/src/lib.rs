@@ -120,8 +120,9 @@ pub mod tagging;
 use tagging::{GetTaggedTciCmd, TagTciCmd};
 
 use caliptra_common::cprintln;
-
-use caliptra_drivers::{Array4x12, CaliptraError, CaliptraResult, ResetReason};
+#[cfg(feature = "mldsa_attestation")]
+use caliptra_drivers::Array4x12;
+use caliptra_drivers::{CaliptraError, CaliptraResult, ResetReason};
 use caliptra_registers::mbox::enums::MboxStatusE;
 pub use dpe::{context::ContextState, tci::TciMeasurement, DpeInstance, U8Bool, MAX_HANDLES};
 use dpe::{dpe_instance::DpeEnv, support::Support};
