@@ -21,9 +21,9 @@ use caliptra_dpe_response_buffer::ResponseBufError;
 use caliptra_drivers::{
     hmac384_kdf, sha384::DpeHasher, Array4x12, Ecc384, Ecc384PrivKeyIn, Ecc384PubKey, Ecc384Scalar,
     Ecc384Seed, ExportedCdiEntry, ExportedCdiHandles, Hmac384, Hmac384Key, Hmac384Tag, KeyId,
-    KeyReadArgs, KeyUsage, KeyVault, KeyWriteArgs, Mldsa87, Mldsa87Mu, Mldsa87PubKey, Mldsa87Seed,
-    Mldsa87Signature, MldsaExportedCdiEntry, PqDevIdCdi, Sha384, Trng, MLDSA87_PRIVATE_SEED_BYTES,
-    PQ_DEVID_CDI_SIZE,
+    KeyReadArgs, KeyUsage, KeyVault, KeyWriteArgs, Mldsa87, Mldsa87Mu, Mldsa87PubKey,
+    Mldsa87Result, Mldsa87Seed, Mldsa87Signature, MldsaExportedCdiEntry, PqDevIdCdi, Sha384, Trng,
+    MLDSA87_PRIVATE_SEED_BYTES, PQ_DEVID_CDI_SIZE,
 };
 use caliptra_error::CaliptraResult;
 use constant_time_eq::constant_time_eq;
@@ -39,6 +39,10 @@ use crypto::{
 };
 use dpe::{EcdsaAlgorithm, ExportedCdiHandle, U8Bool, MAX_EXPORTED_CDI_SIZE};
 use zerocopy::FromBytes;
+
+/// `CryptoError::CryptoLibError` code reported when the ML-DSA pair-wise
+/// consistency test rejects a freshly derived key.
+const PWCT_FAILED: u32 = 5;
 use zeroize::Zeroizing;
 
 // A CDI, held either as a key-vault slot (ECDSA) or in memory (ML-DSA). Used for
@@ -391,6 +395,54 @@ impl<'a> DpeCrypto<'a> {
     }
 }
 
+// Pair-wise consistency test for a derived ML-DSA key: sign a fixed message with
+// the private seed and verify that signature with the public key derived from the
+// same seed, so the check exercises the key pair itself rather than any signature
+// the caller happens to want.
+//
+// Stack shape matters more than usual here. The ML-DSA sign leg alone reaches
+// within a few hundred bytes of the runtime stack, so the check runs with as
+// little live state as possible beneath it: the signature is written into the
+// caller's `out` buffer (which the real signature overwrites straight after)
+// rather than a second 4,627-byte local, and the 2,592-byte public key lives in
+// `pwct_verify_mldsa`'s frame so it is only allocated once the sign has returned.
+impl DpeCrypto<'_> {
+    #[inline(never)]
+    fn pwct_mldsa(seed: &Mldsa87Seed, out: &mut Signature) -> Result<(), CryptoError> {
+        let Signature::Mldsa(MldsaSignature(buf)) = out else {
+            return Err(CryptoError::MismatchedAlgorithm);
+        };
+        let sig =
+            Mldsa87Signature::mut_from_bytes(buf.as_mut_slice()).map_err(|_| CryptoError::Size)?;
+
+        // An all-zero mu: the test only has to prove the pair agrees, so the
+        // message it agrees on is arbitrary and is kept constant.
+        let mu = Mldsa87Mu::default();
+        Mldsa87::sign_mu_deterministic(seed, &mu, sig)
+            .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
+
+        Self::pwct_verify_mldsa(seed, sig, &mu)
+    }
+
+    #[inline(never)]
+    fn pwct_verify_mldsa(
+        seed: &Mldsa87Seed,
+        sig: &Mldsa87Signature,
+        mu: &Mldsa87Mu,
+    ) -> Result<(), CryptoError> {
+        let mut pub_key = Mldsa87PubKey::default();
+        Mldsa87::pub_from_seed(seed, &mut pub_key, None)
+            .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
+
+        let result = Mldsa87::verify_mu(&pub_key, sig, mu)
+            .map_err(|e| CryptoError::CryptoLibError(u32::from(e)))?;
+        if result != Mldsa87Result::Success {
+            return Err(CryptoError::CryptoLibError(PWCT_FAILED));
+        }
+        Ok(())
+    }
+}
+
 impl CryptoSuite for DpeCrypto<'_> {}
 
 impl SignatureType for DpeCrypto<'_> {
@@ -660,6 +712,7 @@ impl crypto::Signer for DpeCrypto<'_> {
                 let Some(DerivedKey::Mldsa(seed)) = &self.derived_key else {
                     return Err(CryptoError::CryptoLibError(3));
                 };
+                Self::pwct_mldsa(seed, out)?;
                 Self::sign_helper_mldsa(data, seed, out)
             }
         }

@@ -203,6 +203,30 @@ impl Mldsa87 {
         Ok(Mldsa87Sw::verify(pub_key, sig, msg))
     }
 
+    /// Verify an ML-DSA-87 signature over a precomputed `mu`.
+    ///
+    /// [`Self::verify`] recomputes `mu` from the public key and message; this
+    /// takes it directly, so it pairs with [`Self::sign_mu_deterministic`].
+    ///
+    /// # Arguments
+    ///
+    /// * `pub_key` - Encoded public key
+    /// * `sig` - Encoded signature
+    /// * `mu` - Message representative that was signed
+    ///
+    /// # Returns
+    ///
+    /// [`Mldsa87Result::Success`] if the signature is valid, otherwise
+    /// [`Mldsa87Result::SigVerifyFailed`].
+    #[inline(never)]
+    pub fn verify_mu(
+        pub_key: &Mldsa87PubKey,
+        sig: &Mldsa87Signature,
+        mu: &Mldsa87Mu,
+    ) -> CaliptraResult<Mldsa87Result> {
+        Ok(Mldsa87Sw::verify_mu(pub_key, sig, mu))
+    }
+
     /// Verify an ML-DSA-87 signature over `msg` using an explicit signing
     /// `context`.
     ///
